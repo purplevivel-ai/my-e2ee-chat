@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Эфемерный Чат (E2EE)</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 20px; display: flex; justify-content: center; }
+    .card { background: #1e1e1e; width: 100%; max-width: 500px; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+    h2 { margin-top: 0; color: #fff; text-align: center; }
+    input, button { width: 100%; padding: 12px; margin-top: 10px; border-radius: 8px; border: 1px solid #333; background: #2a2a2a; color: #fff; font-size: 16px; }
+    button { background: #007aff; border: none; font-weight: bold; cursor: pointer; }
+    button.danger { background: #ff3b30; }
+    #chatBox { height: 350px; overflow-y: auto; border: 1px solid #333; padding: 10px; border-radius: 8px; margin: 15px 0; background: #181818; }
+    .msg { margin-bottom: 10px; padding: 8px 12px; border-radius: 6px; background: #262626; word-break: break-word; }
+    .msg.sys { background: #332b00; color: #ffd700; font-size: 13px; text-align: center; }
+    .msg .author { font-weight: bold; color: #0a84ff; display: block; font-size: 12px; margin-bottom: 4px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <h2>Одноразовый E2EE Чат</h2>
+
+  <!-- Экран входа / создания -->
+  <div id="setupScreen">
+    <input id="nickInput" placeholder="Ваш никнейм" maxlength="20" />
+    <button onclick="createRoom()">Создать новую комнату</button>
+    <hr style="border-color: #333; margin: 20px 0;">
+    <input id="roomIdInput" placeholder="4-значный ID комнаты" maxlength="4" />
+    <button onclick="joinRoom()" style="background: #34c759;">Войти по ID</button>
+  </div>
+
+  <!-- Экран чата -->
+  <div id="chatScreen" class="hidden">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <span>ID комнаты: <b id="displayRoomId" style="color: #34c759;">----</b></span>
+      <button onclick="destroyChatManual()" class="danger" style="width: auto; padding: 6px 12px; margin: 0;">Уничтожить</button>
+    </div>
+    
+    <div id="chatBox"></div>
+
+    <div style="display: flex; gap: 8px;">
+      <input id="messageInput" placeholder="Зашифрованное сообщение..." onkeydown="if(event.key==='Enter') sendMessage()" />
+      <button onclick="sendMessage()" style="width: 100px;">Отправить</button>
+    </div>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  const socket = io();
+  let cryptoKey = null;
+  let currentNick = '';
+
+  // 1. Инициализация ключа шифрования (Web Crypto API)
+  async function generateKey() {
+    return await window.crypto.subtle.generateKey(
+      { name: "AES-GCM", length: 256 },
+      true,
+      ["encrypt", "decrypt"]
+    );
+  }
+
+  async function exportKeyBase64(key) {
+    const exported = await window.crypto.subtle.exportKey("raw", key);
+    return btoa(String.fromCharCode(...new Uint8Array(exported)));
+  }
+
+  async function importKeyBase64(base64Key) {
+    const raw = Uint8Array.from(atob(base64Key), c => c.charCodeAt(0));
+    return await window.crypto.subtle.importKey(
+      "raw", raw, { name: "AES-GCM" }, true, ["encrypt", "decrypt"]
+    );
+  }
+
+  // 2. Создание комнаты
+  async function createRoom() {
+    currentNick = document.getElementById('nickInput').value.trim() || 'Аноним';
+    cryptoKey = await generateKey();
+    const keyString = await exportKeyBase64(cryptoKey);
+    
+    // Сохраняем ключ в хеш URL (#key=...), который НЕ отправляется на сервер
+    window.location.hash = `key=${encodeURIComponent(keyString)}`;
+    socket.emit('create_room');
+  }
+
+  socket.on('room_created', ({ roomId }) => {
+    setupChatUI(roomId);
+    addSystemMessage(`Комната создана. Передайте собеседнику ID: ${roomId} и всю ссылку целиком.`);
+  });
+
+  // 3. Вход в комнату
+  async function joinRoom() {
+    currentNick = document.getElementById('nickInput').value.trim() || 'Аноним';
+    const roomId = document.getElementById('roomIdInput').value.trim();
+    if (!roomId) return alert('Введите ID комнаты');
+
+    // Проверяем наличие ключа в URL
+    const hash = new URLSearchParams(window.location.hash.substring(1));
+    const keyString = hash.get('key');
+
+    if (keyString) {
+      cryptoKey = await importKeyBase64(decodeURIComponent(keyString));
+    } else {
+      alert('Внимание: Ссылка не содержит секретного ключа (#key). Вы не сможете расшифровать сообщения.');
+    }
+
+    setupChatUI(roomId);
+    socket.emit('join_room', { roomId, nick: currentNick });
+  }
+
+  // 4. Шифрование и отправка сообщений
+  async function sendMessage() {
+    const input = document.getElementById('messageInput');
+    const text = input.value.trim();
+    if (!text || !cryptoKey) return;
+
+    const enc = new TextEncoder();
+    const iv = window.crypto.getRandomValues(new Uint8Array(12)); // Инициализирующий вектор
+
+    const encryptedContent = await window.crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: iv },
+      cryptoKey,
+      enc.encode(JSON.stringify({ user: currentNick, text: text }))
+    );
+
+    // Отправляем на сервер массив байтов
+    socket.emit('send_encrypted_message', {
+      iv: Array.from(iv),
+      data: Array.from(new Uint8Array(encryptedContent))
+    });
+
+    appendMessage(currentNick, text);
+    input.value = '';
+  }
+
+  // 5. Расшифровка входящих сообщений
+  socket.on('receive_encrypted_message', async ({ iv, data }) => {
+    if (!cryptoKey) return;
+
+    try {
+      const decrypted = await window.crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: new Uint8Array(iv) },
+        cryptoKey,
+        new Uint8Array(data)
+      );
+
+      const dec = new TextDecoder();
+      const payload = JSON.parse(dec.decode(decrypted));
+      appendMessage(payload.user, payload.text);
+    } catch (e) {
+      addSystemMessage('Ошибка расшифровки пакета (неверный ключ или сбой данных).');
+    }
+  });
+
+  // 6. Сигналы управления сессией
+  socket.on('chat_ready', ({ message }) => addSystemMessage(message));
+  socket.on('peer_paused', ({ message }) => addSystemMessage(message));
+  socket.on('error_message', (msg) => alert(msg));
+
+  socket.on('security_breach', (msg) => selfDestruct(msg));
+  socket.on('room_destroyed', (msg) => selfDestruct(msg));
+
+  function destroyChatManual() {
+    socket.emit('destroy_room_manual');
+  }
+
+  // Полное затирание памяти браузера (Self-Destruct)
+  function selfDestruct(reason) {
+    alert(reason);
+    cryptoKey = null;
+    document.getElementById('chatBox').innerHTML = '';
+    window.location.hash = '';
+    window.location.href = 'about:blank';
+  }
+
+  // Вспомогательные функции UI
+  function setupChatUI(roomId) {
+    document.getElementById('setupScreen').classList.add('hidden');
+    document.getElementById('chatScreen').classList.remove('hidden');
+    document.getElementById('displayRoomId').innerText = roomId;
+  }
+
+  function appendMessage(author, text) {
+    const box = document.getElementById('chatBox');
+    const div = document.createElement('div');
+    div.className = 'msg';
+    div.innerHTML = `<span class="author">${escapeHtml(author)}</span>${escapeHtml(text)}`;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function addSystemMessage(text) {
+    const box = document.getElementById('chatBox');
+    const div = document.createElement('div');
+    div.className = 'msg sys';
+    div.innerText = text;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function escapeHtml(text) {
+    return text.replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m]));
+  }
+</script>
+</body>
+  </html>
