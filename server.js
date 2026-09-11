@@ -1,12 +1,19 @@
 const express = require('express');
 const http = require('http');
+const path = require('path');
 const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-app.use(express.static('public'));
+// Раздаем статические файлы из корня проекта
+app.use(express.static(__dirname));
+
+// Принудительно отдаем index.html при заходе на главную страницу /
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
 
 const rooms = new Map();
 
@@ -20,8 +27,8 @@ io.on('connection', (socket) => {
     } while (rooms.has(roomId));
 
     rooms.set(roomId, {
-      users: new Map(), // socketId -> nick
-      graceTimers: new Map(), // nick -> timer
+      users: new Map(),
+      graceTimers: new Map(),
       status: 'WAITING'
     });
 
@@ -41,14 +48,12 @@ io.on('connection', (socket) => {
       return socket.emit('error_message', 'Чат не найден или уже уничтожен.');
     }
 
-    // Отменяем таймер Grace Period, если пользователь возвращается
     if (room.graceTimers.has(nick)) {
       clearTimeout(room.graceTimers.get(nick));
       room.graceTimers.delete(nick);
       io.to(roomId).emit('chat_ready', { message: `${nick} вернулся в чат.` });
     }
 
-    // Защита от 3-го лишнего (учитываем уникальные никнеймы/участники)
     const activeNicks = new Set(room.users.values());
     if (activeNicks.size >= 2 && !activeNicks.has(nick)) {
       io.to(roomId).emit('security_breach', 'Обнаружена попытка стороннего подключения! Чат уничтожается.');
@@ -82,7 +87,7 @@ io.on('connection', (socket) => {
     rooms.delete(socket.roomId);
   });
 
-  // 5. Разрыв связи (Grace Period)
+  // 5. Разрыв связи (Grace Period 3 мин)
   socket.on('disconnect', () => {
     const roomId = socket.roomId;
     if (!roomId || !rooms.has(roomId)) return;
@@ -91,20 +96,18 @@ io.on('connection', (socket) => {
     const userNick = socket.nick || room.users.get(socket.id);
     room.users.delete(socket.id);
 
-    // Если в комнате вообще никого не осталось
     if (room.users.size === 0) {
       rooms.delete(roomId);
       return;
     }
 
-    // Запускаем 3-минутный Grace Period для ушедшего ника
     if (userNick) {
       io.to(roomId).emit('peer_paused', { message: `${userNick} временно недоступен. Ожидание: 3 мин.` });
 
       const timer = setTimeout(() => {
         io.to(roomId).emit('room_destroyed', 'Время ожидания переподключения истекло. Чат уничтожен.');
         rooms.delete(roomId);
-      }, 180000); // 180 сек
+      }, 180000);
 
       room.graceTimers.set(userNick, timer);
     }
