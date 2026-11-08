@@ -19,11 +19,12 @@ const rooms = new Map();
 io.on('connection', (socket) => {
 
   socket.on('create_room', ({ sessionToken }) => {
-    const roomId = crypto.randomUUID(); 
+    // Безопасный UUIDv4 или фоллбэк
+    const roomId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
 
     rooms.set(roomId, {
-      users: new Map(), 
-      graceTimers: new Map(),
+      users: new Map(), // socket.id -> sessionToken
+      graceTimers: new Map(), // sessionToken -> timer ID
       status: 'WAITING'
     });
 
@@ -75,9 +76,17 @@ io.on('connection', (socket) => {
   });
 
   socket.on('destroy_room_manual', () => {
-    if (!socket.roomId) return;
-    io.to(socket.roomId).emit('room_destroyed', 'Чат уничтожен одним из участников.');
-    rooms.delete(socket.roomId);
+    const roomId = socket.roomId;
+    if (!roomId) return;
+    
+    // Оповещаем собеседника
+    socket.to(roomId).emit('room_destroyed', 'Чат уничтожен собеседником.');
+    
+    // Удаляем из памяти сервера
+    rooms.delete(roomId);
+    
+    // Принудительно выкидываем сокеты из комнаты
+    io.in(roomId).socketsLeave(roomId);
   });
 
   socket.on('disconnect', () => {
@@ -88,11 +97,13 @@ io.on('connection', (socket) => {
     const token = socket.sessionToken || room.users.get(socket.id);
     room.users.delete(socket.id);
 
+    // Если никого не осталось
     if (room.users.size === 0) {
       rooms.delete(roomId);
       return;
     }
 
+    // Запускаем таймер на 3 минуты для оставшегося собеседника
     if (token) {
       io.to(roomId).emit('peer_paused', { message: 'Собеседник временно недоступен. Ожидание: 3 мин.' });
 
