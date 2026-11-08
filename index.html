@@ -68,7 +68,6 @@
 
 <script src="/socket.io/socket.io.js"></script>
 <script>
-  // Проверка безопасного контекста для Web Crypto API
   if (!window.isSecureContext || !window.crypto || !window.crypto.subtle) {
     document.getElementById('setupScreen').style.display = 'none';
     document.getElementById('securityError').style.display = 'block';
@@ -80,7 +79,6 @@
   let currentNick = '';
   let currentRoomId = '';
   
-  // Надежная генерация случайных строк без Math.random()
   function getSecureRandomString() {
     if (window.crypto.randomUUID) return window.crypto.randomUUID();
     const arr = new Uint8Array(16);
@@ -90,7 +88,26 @@
 
   const sessionToken = getSecureRandomString();
   const seenMessages = new Set();
-  const MESSAGE_TTL = 5 * 60 * 1000; // Жизненный цикл сообщения: 5 минут (защита от старых Replay)
+  const MESSAGE_TTL = 5 * 60 * 1000;
+
+  // --- Защита уровня паранойи (Dead Man's Switch) ---
+  
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && cryptoKey) {
+      if (socket.connected) socket.emit('destroy_room_manual');
+      selfDestruct('Чат уничтожен: экран был заблокирован или свернут.');
+    }
+  });
+
+  window.addEventListener('offline', () => {
+    if (cryptoKey) selfDestruct('Потеряно соединение с сетью. Локальные данные стерты.');
+  });
+
+  socket.on('disconnect', () => {
+    if (cryptoKey) selfDestruct('Связь с сервером прервана. Чат уничтожен из соображений безопасности.');
+  });
+
+  // --- Криптография ---
 
   async function generateKey() {
     return await window.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
@@ -116,8 +133,9 @@
     if (keyParam) {
       try { 
         cryptoKey = await importKeyBase64(decodeURIComponent(keyParam)); 
-        // Удаляем ключ из истории браузера и адресной строки
-        window.history.replaceState(null, '', window.location.pathname);
+        if (window.history.replaceState) {
+          window.history.replaceState(null, '', window.location.pathname);
+        }
       } catch (e) {
         console.error("Key import failed", e);
       }
@@ -125,6 +143,8 @@
   });
 
   socket.on('connect', () => {
+    // Восстановление через сокет заблокировано локальным удалением при 'disconnect',
+    // но логика оставлена на случай первого подключения с готовым ID.
     if (currentRoomId && currentNick) {
       socket.emit('join_room', { roomId: currentRoomId, sessionToken });
     }
@@ -143,8 +163,6 @@
     setupChatUI(roomId);
     
     const inviteUrl = `${window.location.origin}${window.location.pathname}#id=${roomId}&key=${encodeURIComponent(window.tempKeyString)}`;
-    
-    // Формируем безопасную ссылку для приглашения
     addSystemMessage(`Комната создана! Передайте эту ссылку собеседнику (она содержит ключ).`);
     
     const box = document.getElementById('chatBox');
@@ -187,8 +205,6 @@
     try {
       const enc = new TextEncoder();
       const iv = window.crypto.getRandomValues(new Uint8Array(12));
-      
-      // Генерируем ID с меткой времени
       const msgId = `${Date.now()}_${getSecureRandomString()}`;
 
       const encryptedContent = await window.crypto.subtle.encrypt(
@@ -221,12 +237,11 @@
       );
       const payload = JSON.parse(new TextDecoder().decode(decrypted));
       
-      // Жесткая проверка от Replay: возраст + дубликаты
       if (payload.msgId) {
         const parts = payload.msgId.split('_');
         if (parts.length === 2) {
           const timestamp = parseInt(parts[0], 10);
-          if (Date.now() - timestamp > MESSAGE_TTL) return; // Пакет слишком старый
+          if (Date.now() - timestamp > MESSAGE_TTL) return;
         }
         if (seenMessages.has(payload.msgId)) return;
         seenMessages.add(payload.msgId);
@@ -244,14 +259,28 @@
   socket.on('security_breach', (msg) => selfDestruct(msg));
   socket.on('room_destroyed', (msg) => selfDestruct(msg));
 
-  function destroyChatManual() { socket.emit('destroy_room_manual'); }
+  function destroyChatManual() { 
+    socket.emit('destroy_room_manual'); 
+    selfDestruct('Вы уничтожили чат.');
+  }
 
   function selfDestruct(reason) {
-    alert(reason);
+    if (!cryptoKey && !currentRoomId) return; // Защита от двойного вызова
+    
     cryptoKey = null;
+    currentRoomId = '';
+    
     document.getElementById('chatBox').innerHTML = '';
+    document.getElementById('chatScreen').classList.add('hidden');
+    document.getElementById('setupScreen').classList.remove('hidden');
+    document.getElementById('roomIdInput').value = '';
+    
     window.location.hash = '';
-    window.location.href = 'about:blank';
+    if (window.history.replaceState) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+    
+    setTimeout(() => alert(reason), 50);
   }
 
   function setupChatUI(roomId) {
